@@ -10,6 +10,7 @@ class SchedulesController < ApplicationController
     # Filters
     before_filter :require_login
     before_filter :find_users_and_projects, :only => [:index, :edit, :users, :projects, :fill]
+    before_filter :find_project_by_version, :only => [:estimate]
     before_filter :save_entries, :only => [:edit]
     before_filter :save_default, :only => [:default]
     before_filter :fill_entries, :only => [:fill]
@@ -100,6 +101,201 @@ class SchedulesController < ApplicationController
         @defaults = get_defaults(user_ids).index_by { |default| default.user_id }
         @defaults.delete_if { |user_id, default| !default.weekday_hours.detect { |weekday| weekday != 0 }}
         @calendar = Redmine::Helpers::Calendar.new(Date.today, current_language, :week)
+    end
+
+
+    # Given a version, we want to estimate when it can be completed. To generate
+    # this date, we need open issues to have time estimates and for assigned
+    # individuals to have scheduled time.
+    #
+    # This function makes a number of assumtions when generating the estimate that,
+    # in practice, aren't generally true. For example, issues may have multiple
+    # users addressing them or may require validation before the next step begins.
+    # Issues often have undeclared dependancies that aren't initially clear. These
+    # may affect when the version is completed.
+    #
+    # Note that this method talks about issue parents and children. These refer to
+    # to issues that are blocked or preceded by others.
+    def estimate
+        # Disable over-optimistic locking
+        ActiveRecord::Base.lock_optimistically = false
+        
+        # Obtain all open issues for the given version
+        raise l(:error_schedules_not_enabled) unless @version.project.module_enabled?('schedule_module')
+        @open_issues = @version.fixed_issues.select { |issue| !issue.closed? }.index_by { |issue| issue.id }
+
+        # Confirm that all issues have estimates, are assigned and only have parents in this version
+        raise l(:error_schedules_estimate_unestimated_issues) unless @open_issues.select { |issue_id, issue| issue.estimated_hours.nil? }.empty?
+        raise l(:error_schedules_estimate_unassigned_issues) unless @open_issues.select { |issue_id, issue| issue.assigned_to.nil? }.empty?
+        raise l(:error_schedules_estimate_open_interversion_parents) unless @open_issues.collect do |issue_id, issue|
+            issue.relations.collect do |relation|
+                Issue.find(
+                    :first,
+                    :include => :status,
+                    :conditions => ["#{Issue.table_name}.id=? AND #{IssueStatus.table_name}.is_closed=? AND (#{Issue.table_name}.fixed_version_id<>? OR #{Issue.table_name}.fixed_version_id IS NULL)", relation.issue_from_id, false, @version.id]
+                ) if (relation.issue_to_id == issue.id) && schedule_relation?(relation)
+            end
+        end.flatten.compact.empty?
+
+        # Obtain available time for assignees 
+        @users = @open_issues.collect { |issue_id, issue| issue.assigned_to }.uniq
+        @available_times = Hash[*@users.collect { |user| [user.id, {}] }.flatten]
+        @scheduled_times = Hash[*@users.collect { |user| [user.id, {}] }.flatten]
+        get_availabilities(Date.today, Date.today + 180, true).each do |entry|
+        	entry[1].each do |userid,hours|
+        		@available_times[userid][entry[0]] = hours if hours != 0
+        	end
+        end
+        
+        # Build issue precedence hierarchy
+        floating_issues = Set.new    # Issues with no children or parents
+        surfaced_issues = Set.new    # Issues with children, but no parents 
+        buried_issues = Set.new      # Issues with parents
+        @open_issues.each do |issue_id, issue|
+            issue.start_date = nil
+            issue.due_date = nil
+            issue.relations.each do |relation|
+                if (relation.issue_to_id == issue.id) && schedule_relation?(relation)
+                    if @open_issues.has_key?(relation.issue_from_id)
+                        buried_issues.add(issue)
+                        surfaced_issues.add(@open_issues[relation.issue_from_id])
+                    end
+                end
+            end
+        end
+        surfaced_issues.subtract(buried_issues)
+        floating_issues = Set.new(@open_issues.values).subtract(surfaced_issues).subtract(buried_issues)
+
+        # Surface issues and schedule them
+        while !surfaced_issues.empty?
+            buried_issues.subtract(surfaced_issues)
+            
+            next_layer = Set.new    # Issues surfaced by scheduling the current layer
+            surfaced_issues.each do |surfaced_issue|
+                
+                # Schedule the surfaced issue
+                schedule_issue(surfaced_issue)
+                
+                # Move child issues to appropriate buckets
+                surfaced_issue.relations.each do |relation|
+                    if (relation.issue_from_id == surfaced_issue.id) && schedule_relation?(relation) && @open_issues.include?(relation.issue_to_id) && buried_issues.include?(@open_issues[relation.issue_to_id])
+                        considered_issue = @open_issues[relation.issue_to_id]
+                        
+                        # If the issue is blocked by buried relations, then it stays buried
+                        if !considered_issue.relations.collect { |r| true if (r.issue_to_id == considered_issue.id) && schedule_relation?(r) && buried_issues.include?(@open_issues[r.issue_from_id]) }.compact.empty?
+                            
+                        # If the issue blocks buried relations, then it surfaces
+                        elsif !considered_issue.relations.collect { |r| true if (r.issue_from_id == considered_issue.id) && schedule_relation?(r) && buried_issues.include?(@open_issues[r.issue_to_id]) }.compact.empty?
+                            next_layer.add(considered_issue)
+                        
+                        # If the issue has no buried relations, then it floats
+                        else
+                            buried_issues.delete(considered_issue)
+                            floating_issues.add(considered_issue)
+                        end
+                    end
+                end
+            end
+            surfaced_issues = next_layer
+        end
+
+        # Schedule remaining floating issues by priority
+        floating_issues.sort { |a,b| b.priority <=> a.priority }.each { |floating_issue| schedule_issue(floating_issue) }
+        
+        # Version effective date is the latest due date of all open issues
+        @version.effective_date = @open_issues.collect { |issue_id, issue| issue }.max { |a,b| a.due_date <=> b.due_date }.due_date
+        
+        # Save the issues and milestone date if requested.
+        if params[:confirm_estimate]
+            
+            # Fill the users' schedules with the appropriate times    
+        	@scheduled_times.each do |userid,date_hours|
+        		date_hours.each do |date,hours|
+	                old_entry = ScheduleEntry.find(:first, :conditions => {:project_id => @project.id, :user_id => userid, :date => date})
+	                old_entry.delete unless old_entry.nil?
+	                entry = ScheduleEntry.new
+	        	    entry.project_id = @project.id
+	            	entry.user_id = userid
+	               	entry.date = date
+	                entry.hours = hours
+	                entry.save
+	            end
+        	end
+        
+            @open_issues.each { |issue_id, issue| issue.save }
+            @version.save
+            flash[:notice] = l(:label_schedules_estimate_updated)
+            redirect_to({:controller => 'versions', :action => 'show', :id => @version.id})
+        end
+        ActiveRecord::Base.lock_optimistically = true
+        
+    rescue Exception => e
+        flash[:error] = e.message
+        redirect_to({:controller => 'versions', :action => 'show', :id => @version.id})
+    end
+
+
+    # 
+    def report
+        timelog_report
+    end
+    
+    
+    # This method is based off of Redmine's timelog. It has been modified
+    # to accommodate the needs of the Schedules plugin. In the event that
+    # changes are made to the original, this method will need to be updated
+    # accordingly. As such, efforts should be made to modify this method as
+    # little as possible as it's effectively a branch that we want to keep
+    # in sync. 
+    def details
+      sort_init 'date', 'desc'
+        sort_update 'date' => 'date',
+                    'user' => 'user_id',
+                    'project' => "#{Project.table_name}.name",
+                    'hours' => 'hours'
+        
+        cond = ARCondition.new
+        if @project.nil?
+          cond << Project.allowed_to_condition(User.current, :view_schedules)
+        end
+        
+        retrieve_date_range
+        cond << ['date BETWEEN ? AND ?', @from, @to]
+    
+        ScheduleEntry.visible_by(User.current) do
+          respond_to do |format|
+            format.html {
+              # Paginate results
+              @entry_count = ScheduleEntry.count(:include => :project, :conditions => cond.conditions)
+              @entry_pages = Paginator.new self, @entry_count, per_page_option, params['page']
+              @entries = ScheduleEntry.find(:all, 
+                                        :include => [:project, :user],
+                                        :conditions => cond.conditions,
+                                        :order => sort_clause,
+                                        :limit  =>  @entry_pages.items_per_page,
+                                        :offset =>  @entry_pages.current.offset)
+              @total_hours = ScheduleEntry.sum(:hours, :include => :project, :conditions => cond.conditions).to_f
+    
+              render :layout => !request.xhr?
+            }
+            format.atom {
+              entries = ScheduleEntry.find(:all,
+                                       :include => [:project, :user],
+                                       :conditions => cond.conditions,
+                                       :order => "#{ScheduleEntry.table_name}.created_on DESC",
+                                       :limit => Setting.feeds_limit.to_i)
+              render_feed(entries, :title => l(:label_spent_time))
+            }
+            format.csv {
+              # Export all entries
+              @entries = ScheduleEntry.find(:all, 
+                                        :include => [:project, :user],
+                                        :conditions => cond.conditions,
+                                        :order => sort_clause)
+              send_data(entries_to_csv(@entries).read, :type => 'text/csv; header=present', :filename => 'timelog.csv')
+            }
+          end
+        end
     end
 
 
@@ -417,6 +613,77 @@ class SchedulesController < ApplicationController
         render_404
     end
 
+
+    # Determines if a given relation will prevent another from being worked on
+    def schedule_relation?(relation)
+        return (relation.relation_type == "blocks" || relation.relation_type == "precedes")
+    end
+    
+    
+    # This function will schedule an issue for the earliest open schedule for the
+    # issue's assignee. 
+    def schedule_issue(issue)
+
+        # Issues start no earlier than today
+        possible_start = [Date.today]
+        
+        # Find out when parent issues from this version have been tentatively scheduled for
+        possible_start << issue.relations.collect do |relation|
+            @open_issues[relation.issue_from_id] if (relation.issue_to_id == issue.id) && schedule_relation?(relation)
+        end.compact.collect do |related_issue|
+            related_issue if related_issue.fixed_version == issue.fixed_version
+        end.compact.collect do |related_issue|
+            related_issue.due_date
+        end.max
+        
+        # Find out when parent issues outside of this version are due 
+        possible_start << issue.relations.collect do |relation|
+            Issue.find(relation.issue_from_id) if (relation.issue_to_id == issue.id) && schedule_relation?(relation)
+        end.compact.collect do |related_issue|
+            related_issue if related_issue.fixed_version != issue.fixed_version
+        end.compact.collect do |related_issue|
+            related_issue.due_date unless related_issue.due_date.nil?
+        end.compact.max
+
+        # Determine the earliest possible start date for this issue
+        possible_start = possible_start.compact.max
+        if issue.done_ratio == 100 || @available_times[issue.assigned_to.id].nil?
+            considered_date = possible_start + 1
+        else
+            considered_date = @available_times[issue.assigned_to.id].keys.select { |date| date > possible_start }
+            params[:testing ] = @available_times
+            raise l(:error_schedules_estimate_insufficient_scheduling, issue.assigned_to.to_s + " // " + issue.to_s + " // " + possible_start.to_s) if considered_date.empty?
+            considered_date = considered_date.min
+        end
+        hours_remaining = issue.estimated_hours * ((100-issue.done_ratio)*0.01) unless issue.estimated_hours.nil?
+        hours_remaining ||= 0
+        
+        # Chew up the necessary time starting from the earliest schedule opening
+        # after the possible start dates.
+        issue.start_date = considered_date
+        while hours_remaining > 0
+            considered_date_round = considered_date
+            while !@available_times[issue.assigned_to.id].nil? && @available_times[issue.assigned_to.id][considered_date].nil? && !@available_times[issue.assigned_to.id].empty? && (considered_date < Date.today + 180) 
+                considered_date += 1
+            end
+            raise l(:error_schedules_estimate_insufficient_scheduling, issue.assigned_to.to_s + " // " + issue.to_s + " // " + considered_date_round.to_s) if @available_times[issue.assigned_to.id].nil? || @available_times[issue.assigned_to.id][considered_date].nil?
+            @scheduled_times[issue.assigned_to.id][considered_date] ||= 0
+            if hours_remaining >= @available_times[issue.assigned_to.id][considered_date]
+                hours_remaining -= @available_times[issue.assigned_to.id][considered_date]
+            	@scheduled_times[issue.assigned_to.id][considered_date] += @available_times[issue.assigned_to.id][considered_date]
+                @available_times[issue.assigned_to.id].delete(considered_date)
+            else
+            	@scheduled_times[issue.assigned_to.id][considered_date] += hours_remaining
+                @available_times[issue.assigned_to.id][considered_date] -= hours_remaining
+                hours_remaining = 0
+            end
+        end
+        issue.due_date = considered_date
+        
+        # Store the modified issue back to the global
+        @open_issues[issue.id] = issue
+    end
+    
 
     ############################################################################
     # Instance method interfaces to class methods
