@@ -10,4 +10,6 @@ RedmineApp::Application.routes.draw do
   match 'projects/:project_id/schedules/details', :controller => 'schedules', :action => 'details'
   match 'projects/:project_id/schedules/edit', :controller => 'schedules', :action => 'edit'
   match 'projects/:project_id/schedules/fill', :controller => 'schedules', :action => 'fill'
+
+  match 'versions/:id/estimate', :controller => 'schedules', :action => 'estimate'
 end

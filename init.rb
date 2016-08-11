@@ -1,7 +1,13 @@
 require 'redmine'
 require 'holidays'
-require 'holidays/ca'       # Edit this to the most appropriate holiday region for you: http://code.dunae.ca/svn/holidays/trunk/data/
+require 'generated_definitions/ca'       # Edit this to the most appropriate holiday region for you: http://code.dunae.ca/svn/holidays/trunk/data/
 $holiday_locale = 'ca_bc'   # Set this to the same region (or subregion if appropriate)
+
+require 'holidays/core_extensions/date'
+
+class Date
+    include Holidays::CoreExtensions::Date
+end
 
 require_dependency 'schedule_compatibility'
 

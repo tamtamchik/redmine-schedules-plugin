@@ -1,5 +1,6 @@
 <h2><%= l(:label_schedules_estimate) %></h2>
-<% form_tag({:action=> "estimate"}) do %>
+
+<%= form_tag({:action=> "estimate"}) do %>
 	<% if @open_issues && @open_issues.any? %>
 		<table class="list issues">
 			<thead>
@@ -19,7 +20,7 @@
 					<tr>
 						<td class="id"><%= link_to issue.id, :controller => 'issues', :action => 'show', :id => issue %></td>
 						<td class="tracker"><%=h issue.tracker %></td>
-						<td class="subject"><%= link_to h(truncate(issue.subject, 60)), :controller => 'issues', :action => 'show', :id => issue %> (<%=h issue.status %>)</td>
+						<td class="subject"><%= link_to truncate(issue.subject, length: 60), :controller => 'issues', :action => 'show', :id => issue %> (<%=h issue.status %>)</td>
 						<td><%= issue.assigned_to %></td>
 						<td><%= issue.start_date %></td>
 						<td><%= issue.due_date %></td>
